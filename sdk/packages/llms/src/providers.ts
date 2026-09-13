@@ -1,4 +1,5 @@
 export {
+	getGeneratedModelsForRuntimeProvider,
 	isProviderApiLine,
 	OLLAMA_DEFAULT_CONTEXT_WINDOW,
 	type ProviderApiLine,
@@ -34,6 +35,7 @@ import {
 	type ProviderConfig,
 } from "./providers/types";
 
+export { classifyProviderError } from "./providers/error-classification";
 export {
 	ClineFreeModelLimitError,
 	ClineNotSubscribedError,

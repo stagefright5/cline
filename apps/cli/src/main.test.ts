@@ -66,6 +66,7 @@ const dashboardMocks = vi.hoisted(() => ({
 }));
 const connectMocks = vi.hoisted(() => ({
 	formatAdapterList: vi.fn(() => ""),
+	runCleanupConnectorInstance: vi.fn(async () => 0),
 	runConnectAdapter: vi.fn(async () => 0),
 	runRestartConnector: vi.fn(async () => 0),
 	runStopAllConnectors: vi.fn(async () => 0),
@@ -164,8 +165,14 @@ vi.mock("./runtime/run-interactive", () => {
 vi.mock("./utils/session", () => sessionMocks);
 vi.mock("./session/session", () => sessionMocks);
 vi.mock("@cline/core", async () => {
+	// Keep dispatch tests independent of the full SDK runtime import graph.
+	// Only persisted-settings behavior needs its real implementation here.
+	const { readGlobalSettings } = await vi.importActual<
+		typeof import("../../../sdk/packages/core/src/services/global-settings")
+	>("../../../sdk/packages/core/src/services/global-settings");
 	return {
-		...(await vi.importActual("@cline/core")),
+		readGlobalSettings,
+		setSdkLogger: vi.fn(),
 		resolveProviderConfig: llmMocks.resolveProviderConfig,
 		createTeamName: vi.fn(() => "team-test"),
 		createUserInstructionConfigService: vi.fn(() => ({
@@ -394,6 +401,68 @@ describe("runCli lightweight command dispatch", () => {
 		);
 		expect(connectMocks.runConnectAdapter).not.toHaveBeenCalled();
 		expect(connectMocks.runStopConnector).not.toHaveBeenCalled();
+	});
+
+	it("routes a supervised cleanup to one connector instance", async () => {
+		connectMocks.runCleanupConnectorInstance.mockClear();
+		connectMocks.runConnectAdapter.mockClear();
+		process.argv = [
+			"bun",
+			"src/index.ts",
+			"connect",
+			"--cleanup-instance",
+			"cline-slack",
+			"slack",
+		];
+
+		const { runCli } = await import("./main");
+
+		await expect(runCli()).resolves.toBeUndefined();
+		expect(process.exitCode).toBe(0);
+		expect(connectMocks.runCleanupConnectorInstance).toHaveBeenCalledWith(
+			"slack",
+			"cline-slack",
+			expect.any(Object),
+		);
+		expect(connectMocks.runConnectAdapter).not.toHaveBeenCalled();
+	});
+
+	it("rejects combining cleanup with another connect mode", async () => {
+		connectMocks.runCleanupConnectorInstance.mockClear();
+		connectMocks.runStopConnector.mockClear();
+		process.argv = [
+			"bun",
+			"src/index.ts",
+			"connect",
+			"--cleanup-instance",
+			"cline-slack",
+			"--stop",
+			"slack",
+		];
+
+		const { runCli } = await import("./main");
+
+		await runCli();
+		expect(process.exitCode).toBe(1);
+		expect(connectMocks.runCleanupConnectorInstance).not.toHaveBeenCalled();
+		expect(connectMocks.runStopConnector).not.toHaveBeenCalled();
+	});
+
+	it("requires a channel for a supervised cleanup", async () => {
+		connectMocks.runCleanupConnectorInstance.mockClear();
+		process.argv = [
+			"bun",
+			"src/index.ts",
+			"connect",
+			"--cleanup-instance",
+			"x",
+		];
+
+		const { runCli } = await import("./main");
+
+		await runCli();
+		expect(process.exitCode).toBe(1);
+		expect(connectMocks.runCleanupConnectorInstance).not.toHaveBeenCalled();
 	});
 
 	it("routes a targeted connector restart to one instance", async () => {

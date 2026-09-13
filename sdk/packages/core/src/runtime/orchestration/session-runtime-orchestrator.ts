@@ -46,7 +46,10 @@ import {
 	type MessageWithMetadata,
 	type ModelInfo,
 	mergeModelOptions,
+	modelSupportsImageInput,
+	modelSupportsToolCalling,
 	type ToolCallRecord,
+	usesImageGenerationOperation,
 } from "@cline/shared";
 import { filterDisabledTools } from "../../services/global-settings";
 import {
@@ -75,6 +78,30 @@ import {
 import { LoopDetectionTracker } from "../safety/loop-detection";
 import { MistakeTracker } from "../safety/mistake-tracker";
 import { RuntimeEventAdapter } from "./runtime-event-adapter";
+
+export const SESSION_RUN_IN_PROGRESS_ERROR_CODE = "session_run_in_progress";
+
+/**
+ * A session was asked to shut down while one of its runs was still in flight and
+ * no abort had been requested.
+ *
+ * Carries a code so callers can recognise it structurally after it crosses the
+ * hub's JSON boundary, where an `Error` arrives as a bare message. Connectors use
+ * it to tell "this thread's session is unusable" apart from a genuine run failure,
+ * and to recover by starting a fresh session instead of wedging the thread.
+ */
+export class SessionRunInProgressError extends Error {
+	readonly code = SESSION_RUN_IN_PROGRESS_ERROR_CODE;
+
+	constructor(readonly agentId?: string) {
+		super(
+			`SessionRuntime.shutdown called while a run is in progress${
+				agentId ? ` (agentId=${agentId})` : ""
+			}`,
+		);
+		this.name = "SessionRunInProgressError";
+	}
+}
 
 function formatToolResultError(output: unknown): string {
 	if (typeof output === "string") {
@@ -362,6 +389,9 @@ export class SessionRuntime {
 	private activeTrackerWork: Promise<void> = Promise.resolve();
 	/** True when tracker logic has issued an abort for the active run. */
 	private trackerAbortInFlight = false;
+	private readonly handleExternalAbort = (): void => {
+		this.abort(this.config.abortSignal?.reason);
+	};
 
 	constructor(config: AgentConfig, deps: SessionRuntimeOrchestratorDeps = {}) {
 		this.config = config;
@@ -628,9 +658,7 @@ export class SessionRuntime {
 	async shutdown(_reason?: string, _timeoutMs?: number): Promise<void> {
 		if (this.running) {
 			if (!this.abortRequested || !this.activeRunPromise) {
-				throw new Error(
-					`SessionRuntime.shutdown called while a run is in progress (agentId=${this.agentId})`,
-				);
+				throw new SessionRunInProgressError(this.agentId);
 			}
 			await this.activeRunPromise;
 		}
@@ -676,9 +704,17 @@ export class SessionRuntime {
 	// Private implementation
 	// -------------------------------------------------------------------
 
-	private async composeSystemPrompt(): Promise<string> {
+	private async composeSystemPrompt(
+		availableToolNames: ReadonlySet<string>,
+	): Promise<string> {
 		const rules: string[] = [];
 		for (const rule of this.contributionRegistry.getRegisteredRules()) {
+			if (
+				rule.whenToolAvailable &&
+				!availableToolNames.has(rule.whenToolAvailable)
+			) {
+				continue;
+			}
 			const content = await resolveRuleContent(rule);
 			if (content) {
 				rules.push(content);
@@ -791,7 +827,6 @@ export class SessionRuntime {
 		}
 
 		// Build the AgentRuntime for this turn.
-		const systemPrompt = await this.composeSystemPrompt();
 		const agentModel = createAgentModelFromConfig(
 			this.config,
 			this.logger,
@@ -823,7 +858,19 @@ export class SessionRuntime {
 		}
 		const conversationId = this.conversation.getConversationId();
 		const modelInfo = tryGetModelInfo(this.config);
-		const tools = Array.from(mergedToolsByName.values());
+		const dedicatedImageGeneration = usesImageGenerationOperation(
+			modelInfo ?? {},
+		);
+		const toolCallingDisabled =
+			dedicatedImageGeneration || !modelSupportsToolCalling(modelInfo ?? {});
+		const availableTools = filterAvailableExtensionTools(
+			Array.from(mergedToolsByName.values()),
+			this.config.toolPolicies,
+		);
+		const tools = toolCallingDisabled ? [] : availableTools;
+		const systemPrompt = await this.composeSystemPrompt(
+			new Set(tools.map((tool) => tool.name)),
+		);
 		// Seed initialMessages with the full prior transcript (including
 		// the user message we just appended) so multi-turn history is
 		// preserved across runs. Fixes P1 #1: prior turns were silently
@@ -844,26 +891,40 @@ export class SessionRuntime {
 			telemetry: this.telemetry,
 			tools,
 			toolContextMetadata: {
-				modelSupportsImages:
-					modelInfo?.capabilities?.includes("images") ?? true,
+				modelSupportsImages: modelSupportsImageInput(modelInfo ?? {}),
 				...this.config.toolContextMetadata,
 			},
 			hooks: this.createRuntimeHooks(),
 			prepareTurn: this.createRuntimePrepareTurn(modelInfo, tools),
 			initialMessages,
+			completionPolicy: toolCallingDisabled ? null : undefined,
 			systemPrompt,
 		});
 		const runtime = this.createAgentRuntimeImpl(runtimeConfig);
 		this.activeRuntime = runtime;
-		if (this.abortRequested) {
-			runtime.abort(this.abortReason);
-		}
 
 		// Subscribe to runtime events; fan out legacy events to listeners
 		// and keep private book-keeping for tool-call records / usage.
 		const unsubscribe = runtime.subscribe((event: AgentRuntimeEvent) => {
+			// AgentRuntime does not accept abort() until run-started. Retain an abort
+			// requested during finite startup and forward it at that existing lifecycle
+			// boundary instead of adding a second initialization-cancellation path.
+			if (event.type === "run-started" && this.abortRequested) {
+				runtime.abort(this.abortReason);
+			}
 			this.handleRuntimeEvent(event);
 		});
+		if (this.config.abortSignal) {
+			if (this.config.abortSignal.aborted) {
+				this.handleExternalAbort();
+			} else {
+				this.config.abortSignal.addEventListener(
+					"abort",
+					this.handleExternalAbort,
+					{ once: true },
+				);
+			}
+		}
 
 		let runResult: AgentRunResult | undefined;
 		let thrownError: Error | undefined;
@@ -881,6 +942,10 @@ export class SessionRuntime {
 			thrownError = error instanceof Error ? error : new Error(String(error));
 		} finally {
 			unsubscribe();
+			this.config.abortSignal?.removeEventListener(
+				"abort",
+				this.handleExternalAbort,
+			);
 			// Drain any in-flight tracker work (mistake/loop side-effects
 			// queued from handleRuntimeEvent) before we clear state so a
 			// late abort can still reach the runtime if needed.
@@ -1020,6 +1085,7 @@ export class SessionRuntime {
 					provider: this.config.providerId,
 					info: modelInfo,
 				},
+				overflowRecovery: context.overflowRecovery,
 				emitStatusNotice: context.emitStatusNotice,
 			});
 			if (!result) {
@@ -1082,6 +1148,9 @@ export class SessionRuntime {
 			case "tool-started": {
 				this.toolStartedAt.set(event.toolCall.toolCallId, new Date());
 				this.toolInputs.set(event.toolCall.toolCallId, event.toolCall.input);
+				if (event.toolCall.execution) {
+					break;
+				}
 				// Loop-detection inspection: identical consecutive
 				// tool-call signatures trip the tracker. On "soft"
 				// verdict we append a recovery notice; on "hard"
@@ -1116,6 +1185,7 @@ export class SessionRuntime {
 				const record: ToolCallRecord = {
 					id: event.toolCall.toolCallId,
 					name: event.toolCall.toolName,
+					execution: event.toolCall.execution,
 					input,
 					output:
 						resultPart?.type === "tool-result" ? resultPart.output : undefined,
@@ -1128,6 +1198,9 @@ export class SessionRuntime {
 					endedAt,
 				};
 				this.currentRunToolCalls.push(record);
+				if (event.toolCall.execution) {
+					break;
+				}
 				// Per-turn success/failure bookkeeping for MistakeTracker.
 				if (isError) {
 					this.currentTurnFailedTools += 1;
